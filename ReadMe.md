@@ -125,7 +125,7 @@ Luma is intentionally minimal.
 
 ## License
 
-Luma is released under an permissive open-source license (choose your preferred license here).
+Luma is released under the permissive open-source license BSD-3-Clause.
 
 ---
 
