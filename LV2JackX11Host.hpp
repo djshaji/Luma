@@ -38,6 +38,7 @@
 
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
+#include <X11/Xutil.h>
 #include <dlfcn.h>
 #include <unistd.h>
 
@@ -151,9 +152,11 @@ public:
         Atom WM_PROTOCOLS = XInternAtom(x_display, "WM_PROTOCOLS", False);
         XSetWMProtocols(x_display, x_window, &WM_DELETE_WINDOW, 1);
         run.store(true, std::memory_order_release);
+        int idle_counter = 0;
+        bool resize_enabled = false;
 
         while (run.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60 FPS
             while (XPending(x_display)) {
                 XEvent ev;
                 XNextEvent(x_display, &ev);
@@ -165,6 +168,15 @@ public:
                         run.store(false, std::memory_order_release);
                         closeHost();
                         return;
+                    }
+                }
+                if (ev.type == ConfigureNotify) {
+                    XConfigureEvent xev = ev.xconfigure;
+                    if (xev.width != wx || xev.height != wy) {
+                        wx = xev.width;
+                        wy = xev.height;
+                        if (resize_enabled)XResizeWindow(
+                            x_display, (Window)ui_widget, xev.width, xev.height);
                     }
                 }
             }
@@ -191,7 +203,13 @@ public:
                 }
             }
             // run plugin UI idle loop
-            if (idle) idle->idle(ui_handle);
+            if (idle) {
+                idle->idle(ui_handle);
+                if (!resize_enabled) {
+                    idle_counter++;
+                    if (idle_counter > 30) resize_enabled = true;
+                }
+            }
         }
     }
 /****************************************************************
@@ -1058,6 +1076,8 @@ private:
     static int ui_resize(LV2UI_Feature_Handle h, int w, int hgt) {
         auto* self = static_cast<LV2X11JackHost*>(h);
         if (!self->x_window || !self->x_display) return 1;
+        self->wx = w;
+        self->wy = hgt;
         XLockDisplay(self->x_display);
         XResizeWindow(self->x_display, self->x_window, w, hgt);
         XFlush(self->x_display);
@@ -1138,11 +1158,13 @@ private:
 
         ui_desc = fn(index);
 
+        long event_mask = StructureNotifyMask;
         x_display = XOpenDisplay(nullptr);
         x_window = XCreateSimpleWindow(
             x_display, DefaultRootWindow(x_display),
             100, 100, 640, 480, 0, 0, 0);
 
+        XSelectInput(x_display, x_window, event_mask);
         XMapWindow(x_display, x_window);
         Atom dnd_version = 5;
         Atom XdndAware = XInternAtom (x_display, "XdndAware", False);
@@ -1171,7 +1193,14 @@ private:
         if (!preset_label.empty()) name += " - " + preset_label;
         XStoreName(x_display, x_window, name.data()); 
         set_xdnd_proxy(x_display, (Window)ui_widget);
-        if (preset_uri.empty()) ui_needs_initial_update.store(true);
+        XSizeHints hints;
+        long supplied;
+
+        if (XGetWMNormalHints(x_display, (Window)ui_widget, &hints, &supplied)) {
+            XSetWMNormalHints(x_display, x_window, &hints);
+        }
+
+        if (!ui_needs_control_update.load()) ui_needs_initial_update.store(true);
         return ui_handle;
     }
 
@@ -1203,6 +1232,8 @@ private:
 
     Display* x_display = nullptr;
     Window x_window = 0;
+    int wx = 640;
+    int wy = 480;
 
     uint32_t max_block_length = 4096;
     uint32_t required_atom_size = 8192;
