@@ -30,6 +30,7 @@
 #include <lv2/atom/forge.h>
 #include <lv2/midi/midi.h>
 #include <lv2/options/options.h>
+#include <lv2/parameters/parameters.h>
 #include <lv2/buf-size/buf-size.h>
 #include <lv2/patch/patch.h>
 #include <lv2/worker/worker.h>
@@ -52,6 +53,7 @@
 #include <cassert>
 #include <ctime>
 #include <algorithm>
+#include <iostream>
 
 /****************************************************************
         LV2X11JackHost - class to host LV2 plugins with X11 GUI's
@@ -60,14 +62,21 @@
 
 class LV2X11JackHost {
 public:
-    explicit LV2X11JackHost(const char* uri)
-        : plugin_uri(uri) {}
+    explicit LV2X11JackHost() {}
 
     ~LV2X11JackHost() {
         closeHost();
     }
 
-    bool init() {
+    void init_world() {
+        world = lilv_world_new();
+        lilv_world_load_all(world);
+        plugs = lilv_world_get_all_plugins(world);
+    }
+
+    bool init(const char* uri) {
+        plugin_uri = uri;
+        if (!world) init_world();
         return init_lilv()
             && init_jack()
             && init_ports()
@@ -212,9 +221,53 @@ public:
             }
         }
     }
-/****************************************************************
-            Preset - list available presets for plugin
 
+/****************************************************************
+            FIND - list available plugin
+                   return a vector with plugin uri and name
+
+****************************************************************/
+
+    std::vector<std::pair<std::string, std::string>>
+                    find_plugin_matches(const std::string& input) {
+
+        // uri / name
+        std::vector<std::pair< std::string, std::string >> results;
+        // lowercase input
+        std::string needle = input;
+        std::transform(needle.begin(), needle.end(), needle.begin(), ::tolower);
+
+        LILV_FOREACH(plugins, i, plugs) {
+
+            const LilvPlugin* p = lilv_plugins_get(plugs, i);
+            std::string uri = lilv_node_as_uri(lilv_plugin_get_uri(p));
+            const LilvNode* name_node = lilv_plugin_get_name(p);
+
+            std::string name = name_node ? lilv_node_as_string(name_node) : "";
+            std::string lname = name;
+            std::transform(lname.begin(), lname.end(), lname.begin(), ::tolower);
+
+            // --- match rules ---
+            bool match = false;
+            // exact URI
+            if (input == uri) match = true;
+            // exact name
+            if (input == name) match = true;
+            // case-insensitive exact name
+            if (needle == lname) match = true;
+            // substring
+            if (lname.find(needle) != std::string::npos) match = true;
+            // substring
+            if (uri.find(needle) != std::string::npos) match = true;
+
+            if (match) results.emplace_back(uri, name);
+        }
+        return results;
+    }
+
+/****************************************************************
+            Preset - find available presets for plugin
+                     return a list with preset uri and name
 ****************************************************************/
 
     struct PresetInfo {
@@ -386,16 +439,16 @@ private:
     };
 
     struct LV2HostWorker {
-        lv2_ringbuffer_t* requests;
-        lv2_ringbuffer_t* responses;
+        lv2_ringbuffer_t* requests = nullptr;
+        lv2_ringbuffer_t* responses = nullptr;
 
         LV2_Worker_Schedule schedule;
         LV2_Feature feature;
-        const LV2_Worker_Interface* iface;
+        const LV2_Worker_Interface* iface = nullptr;
         LV2_Handle dsp_handle;
 
-        std::atomic<bool> running;
-        std::atomic<bool> work_pending;
+        std::atomic<bool> running{false};;
+        std::atomic<bool> work_pending{false};;
         std::thread worker_thread;
     };
 
@@ -555,6 +608,7 @@ private:
         LV2_URID atom_Object;
         LV2_URID atom_Float;
         LV2_URID atom_Int;
+        LV2_URID atom_Double;
         LV2_URID midi_Event;
         LV2_URID buf_maxBlock;
         LV2_URID atom_Path;
@@ -564,24 +618,27 @@ private:
         LV2_URID patch_value;
         LV2_URID atom_Blank;
         LV2_URID atom_Chunk;
+        LV2_URID param_sampleRate;
     } urids;
 
     void init_urids() {
         urids.atom_eventTransfer = map_uri(this, LV2_ATOM__eventTransfer);
-        urids.atom_Sequence = map_uri(this, LV2_ATOM__Sequence);
-        urids.atom_Blank    = map_uri(this, LV2_ATOM__Blank);
-        urids.atom_Chunk    = map_uri(this, LV2_ATOM__Chunk);
-        urids.atom_Object   = map_uri(this, LV2_ATOM__Object);
-        urids.atom_Float    = map_uri(this, LV2_ATOM__Float);
-        urids.atom_Int      = map_uri(this, LV2_ATOM__Int);
-        urids.midi_Event    = map_uri(this, LV2_MIDI__MidiEvent);
-        urids.buf_maxBlock  = map_uri(this, LV2_BUF_SIZE__maxBlockLength);
-        urids.atom_Path     = map_uri(this, LV2_ATOM__Path);
+        urids.atom_Sequence    = map_uri(this, LV2_ATOM__Sequence);
+        urids.atom_Blank       = map_uri(this, LV2_ATOM__Blank);
+        urids.atom_Chunk       = map_uri(this, LV2_ATOM__Chunk);
+        urids.atom_Object      = map_uri(this, LV2_ATOM__Object);
+        urids.atom_Float       = map_uri(this, LV2_ATOM__Float);
+        urids.atom_Int         = map_uri(this, LV2_ATOM__Int);
+        urids.atom_Double      = map_uri(this, LV2_ATOM__Double);
+        urids.midi_Event       = map_uri(this, LV2_MIDI__MidiEvent);
+        urids.buf_maxBlock     = map_uri(this, LV2_BUF_SIZE__maxBlockLength);
+        urids.atom_Path        = map_uri(this, LV2_ATOM__Path);
 
-        urids.patch_Get     = map_uri(this, LV2_PATCH__Get);
-        urids.patch_Set     = map_uri(this, LV2_PATCH__Set);
-        urids.patch_property= map_uri(this, LV2_PATCH__property);
-        urids.patch_value   = map_uri(this, LV2_PATCH__value);
+        urids.patch_Get        = map_uri(this, LV2_PATCH__Get);
+        urids.patch_Set        = map_uri(this, LV2_PATCH__Set);
+        urids.patch_property   = map_uri(this, LV2_PATCH__property);
+        urids.patch_value      = map_uri(this, LV2_PATCH__value);
+        urids.param_sampleRate = map_uri(this, LV2_PARAMETERS__sampleRate);
     }
 
     static LV2_URID map_uri(LV2_URID_Map_Handle h, const char* uri) {
@@ -717,17 +774,14 @@ private:
     }
 
     bool init_lilv() {
-        world = lilv_world_new();
-        lilv_world_load_all(world);
 
-        const LilvPlugins* plugs = lilv_world_get_all_plugins(world);
         plugin = lilv_plugins_get_by_uri(plugs, lilv_new_uri(world, plugin_uri));
         if (!plugin) return false;
         plugin_name = "lv2-x11-host";
-        LilvNode* nd = nullptr;
+        const LilvNode* nd = nullptr;
         nd = lilv_plugin_get_name(plugin);
         plugin_name = lilv_node_as_string(nd);
-        lilv_node_free(nd);
+        //lilv_node_free(nd);
 
         audio_class     = lilv_new_uri(world, LV2_CORE__AudioPort);
         control_class   = lilv_new_uri(world, LV2_CORE__ControlPort);
@@ -737,6 +791,7 @@ private:
         rsz_minimumSize = lilv_new_uri (world, LV2_RESIZE_PORT__minimumSize);
         init_urids();
         init_features();
+        lilv_is_inited.store(true);
         if (!check_resize_port_requirements(plugin)) {
             fprintf(stderr,"%s requires resize-port support – not supported\n", plugin_name.data());
             return false;
@@ -746,6 +801,7 @@ private:
     }
 
     void freeNodes() {
+        if (!lilv_is_inited.load()) return;
         lilv_node_free (audio_class);
         lilv_node_free (control_class);
         lilv_node_free (atom_class);
@@ -1172,6 +1228,22 @@ private:
                         32, PropModeReplace, (unsigned char*)&dnd_version, 1);
         XFlush(x_display);
 
+        float ui_sample_rate = (float)jack_get_sample_rate(jack);
+
+        LV2_Options_Option ui_options[] = {
+            {
+                LV2_OPTIONS_INSTANCE,
+                0,
+                urids.param_sampleRate,
+                sizeof(float),
+                urids.atom_Float,
+                &ui_sample_rate
+            },
+            { LV2_OPTIONS_INSTANCE, 0, 0, 0, 0, nullptr }
+        };
+
+        LV2_Feature ui_options_feature = {LV2_OPTIONS__options, ui_options};
+
         resize.handle    = this;
         resize.ui_resize = ui_resize;
 
@@ -1181,7 +1253,7 @@ private:
         LV2_Feature parent { LV2_UI__parent, (void*)x_window };
         LV2_Feature resize_f { LV2_UI__resize, &resize };
 
-        LV2_Feature* feats[] = { &parent, &resize_f, &pm_f,
+        LV2_Feature* feats[] = { &parent, &resize_f, &pm_f, &ui_options_feature,
                                 &features.um_f, &features.unm_f, nullptr };
 
         ui_handle = ui_desc->instantiate( ui_desc, plugin_uri, bundle,
@@ -1215,6 +1287,7 @@ private:
     std::string plugin_name;
 
     LilvWorld* world = nullptr;
+    const LilvPlugins* plugs =  nullptr;
     const LilvPlugin* plugin = nullptr;
     LilvInstance* instance = nullptr;
 
@@ -1238,6 +1311,7 @@ private:
     uint32_t max_block_length = 4096;
     uint32_t required_atom_size = 8192;
 
+    std::atomic<bool> lilv_is_inited{false};
     std::atomic<bool> ui_dirty{false};
     std::atomic<bool> ui_needs_initial_update{false};
     std::atomic<bool> ui_needs_control_update{false};

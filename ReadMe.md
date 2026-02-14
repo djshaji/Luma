@@ -1,4 +1,3 @@
-
 # Luma
 
 **Luma** is a minimal LV2 host for Linux that runs LV2 plugins with X11 user interfaces using JACK for audio. It is designed to be small, simple, and easy to understand — a compact reference implementation that still supports real-world LV2 features like presets and plugin state.
@@ -19,7 +18,7 @@ Luma focuses on correctness and clarity rather than feature bloat. It is useful 
 * Supports drag and drop
 * JACK audio integration
 * Preset discovery and interactive preset selection
-* Full LV2 state/preset restore support
+* Full LV2 state and preset restore support
 * Atom and control port handling
 * Worker thread support (LV2 Worker extension)
 * Minimal CLI interface
@@ -63,19 +62,43 @@ g++ main.cpp -o luma `pkg-config --cflags --libs jack lilv-0 x11` -ldl
 
 ## Usage
 
-Start Luma by passing an LV2 plugin URI:
+Start Luma by passing an LV2 plugin URI, a plugin name, or a search string:
 
 ```
-./luma <plugin_uri>
+./luma <string>
 ```
 
-Example:
+### Example: passing a search string
+
+```
+./luma neural
+```
+
+If multiple plugins are found, Luma lists them and prompts you to select one:
+
+```
+Find 6 matches:
+[0] AIDA-X                [3] NeuralCapture
+[1] Neural Amp Modeler    [4] Neural Record
+[2] Neural Capture        [5] Neuralrack
+
+ENTER = next page | number = select plugin | q = quit
+>
+```
+
+### Example: passing a URI
 
 ```
 ./luma urn:brummer:neuralrack
 ```
 
-If presets are available, Luma lists them and prompts you to select one:
+### Example: passing a name
+
+```
+./luma neuralrack
+```
+
+If only one plugin matches the search string, Luma presents a list of available presets (if any) and prompts you to select one:
 
 ```
 [0] OrangeCrunch
@@ -85,14 +108,9 @@ Select preset (ENTER = default):
 ```
 
 * Enter a preset number to load it
-* Press ENTER to start with default values
+* Or press ENTER to start with the default state
 
 If no presets are available, the plugin starts with its default state.
-To skip the preset selection start Luma like this
-
-```
-./luma urn:brummer:neuralrack -
-```
 
 ---
 
@@ -101,13 +119,13 @@ To skip the preset selection start Luma like this
 Luma:
 
 1. Loads the LV2 plugin using Lilv
-2. Instantiates the plugin with required LV2 features
+2. Instantiates the plugin with the required LV2 features
 3. Connects JACK audio ports
 4. Loads and restores preset state (if selected)
 5. Launches the plugin’s X11 UI
 6. Runs an event loop that synchronizes DSP and UI
 
-The host implements enough of the LV2 specification to run modern plugins, while remaining intentionally compact and readable.
+The host implements enough of the LV2 specification to run modern plugins while remaining intentionally compact and readable.
 
 ---
 
@@ -125,7 +143,7 @@ Luma is intentionally minimal.
 
 ## License
 
-Luma is released under the permissive open-source license BSD-3-Clause.
+Luma is released under the permissive BSD-3-Clause license.
 
 ---
 
