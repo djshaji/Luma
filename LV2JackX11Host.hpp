@@ -20,6 +20,10 @@
 #include <jack/jack.h>
 #include <jack/midiport.h>
 
+#ifdef __ANDROID__
+#include <oboe/Oboe.h>
+#endif
+
 #include "lv2_ringbuffer.h"
 #include <lilv/lilv.h>
 
@@ -47,6 +51,7 @@
 #include <string>
 #include <atomic>
 #include <unordered_map>
+#include <memory>
 #include <cstring>
 #include <cstdlib>
 #include <thread>
@@ -79,8 +84,17 @@ public:
         if (!world) init_world();
         return init_lilv()
             && init_jack()
-            && init_ports()
+            && init_ports(true)
             && init_instance();
+    }
+
+    bool init_no_jack(const char* uri, double sample_rate, uint32_t max_block) {
+        plugin_uri = uri;
+        if (!world) init_world();
+        max_block_length = max_block;
+        return init_lilv()
+            && init_ports(false)
+            && init_instance(sample_rate);
     }
 
     bool initUi() {
@@ -450,6 +464,8 @@ private:
         std::atomic<bool> running{false};;
         std::atomic<bool> work_pending{false};;
         std::thread worker_thread;
+
+        std::vector<uint8_t> response_buffer;
     };
 
     // store work request in ringbuffer
@@ -515,6 +531,8 @@ private:
 
     // inform plugin when work is done
     void deliver_worker_responses(LV2HostWorker* w) {
+        constexpr size_t kDrainChunk = 256;
+        uint8_t scratch[kDrainChunk];
         while (true) {
             if (lv2_ringbuffer_read_space(w->responses) < sizeof(uint32_t)) break;
 
@@ -525,10 +543,18 @@ private:
 
             lv2_ringbuffer_read(w->responses, (char*)&size, sizeof(uint32_t));
 
-            std::vector<uint8_t> buf(size);
-            lv2_ringbuffer_read(w->responses, (char*)buf.data(), size);
+            if (size <= w->response_buffer.size()) {
+                lv2_ringbuffer_read(w->responses, (char*)w->response_buffer.data(), size);
+                w->iface->work_response(w->dsp_handle, size, w->response_buffer.data());
+                continue;
+            }
 
-            w->iface->work_response(w->dsp_handle, size, buf.data());
+            size_t remaining = size;
+            while (remaining > 0) {
+                const size_t chunk = std::min(remaining, kDrainChunk);
+                lv2_ringbuffer_read(w->responses, (char*)scratch, chunk);
+                remaining -= chunk;
+            }
         }
     }
 
@@ -833,7 +859,7 @@ private:
 
 ****************************************************************/
 
-    bool init_ports() {
+    bool init_ports(bool register_jack) {
         uint32_t n = lilv_plugin_get_num_ports(plugin);
         ports.reserve(n);
         LilvNode* midi_event = lilv_new_uri(world, LV2_MIDI__MidiEvent);
@@ -856,7 +882,7 @@ private:
                 p.symbol = lilv_node_as_string(sym);
                 }
 
-            if (p.is_audio) {
+            if (register_jack && p.is_audio) {
                 p.jack_port = jack_port_register(
                     jack,
                     sym ? lilv_node_as_string(sym) : "audio",
@@ -866,7 +892,7 @@ private:
                 );
             }
 
-            if (p.is_atom && p.is_input && p.is_midi) {
+            if (register_jack && p.is_atom && p.is_input && p.is_midi) {
                 p.jack_port = jack_port_register(
                     jack,
                     sym ? lilv_node_as_string(sym) : "midi",
@@ -876,7 +902,7 @@ private:
                 );
             }
 
-            if (p.is_atom && !p.is_input && p.is_midi) {
+            if (register_jack && p.is_atom && !p.is_input && p.is_midi) {
                 p.jack_port = jack_port_register(
                     jack,
                     sym ? lilv_node_as_string(sym) : "midi",
@@ -927,6 +953,10 @@ private:
 ****************************************************************/
 
     bool init_instance() {
+        return init_instance(jack_get_sample_rate(jack));
+    }
+
+    bool init_instance(double sample_rate) {
 
         LV2_Options_Option options[] = {
             {
@@ -948,8 +978,7 @@ private:
         if (!checkFeatures(plugin, feats)) return false;
 
         // instantiate the plugin dsp instance 
-        instance = lilv_plugin_instantiate(plugin,
-                    jack_get_sample_rate(jack), feats);
+        instance = lilv_plugin_instantiate(plugin, sample_rate, feats);
 
         if (!instance) return false;
 
@@ -963,6 +992,7 @@ private:
             host_worker.dsp_handle = lilv_instance_get_handle(instance);
             host_worker.requests  = lv2_ringbuffer_create(8192);
             host_worker.responses = lv2_ringbuffer_create(8192);
+            host_worker.response_buffer.resize(8192);
             host_worker.running.store(true);
             host_worker.worker_thread =
                 std::thread(worker_thread_func, &host_worker);
@@ -1318,4 +1348,146 @@ private:
     std::atomic<bool> run{false};
     std::atomic<bool> shutdown{false};
 };
+
+#ifdef __ANDROID__
+class LV2OboeHost : public LV2X11JackHost, public oboe::AudioStreamDataCallback {
+public:
+    ~LV2OboeHost() {
+        stop_audio();
+        if (audio_stream) audio_stream->close();
+    }
+
+    bool init_oboe(const char* uri, int32_t sample_rate, int32_t frames_per_burst) {
+        if (!init_no_jack(uri, sample_rate, static_cast<uint32_t>(frames_per_burst)))
+            return false;
+        return init_audio(sample_rate, frames_per_burst);
+    }
+
+    bool init_audio(int32_t sample_rate, int32_t frames_per_burst) {
+        oboe::AudioStreamBuilder builder;
+        oboe::Result result = builder
+            .setDirection(oboe::Direction::Output)
+            .setPerformanceMode(oboe::PerformanceMode::LowLatency)
+            .setSharingMode(oboe::SharingMode::Exclusive)
+            .setFormat(oboe::AudioFormat::Float)
+            .setChannelCount(2)
+            .setSampleRate(sample_rate)
+            .setFramesPerCallback(frames_per_burst)
+            .setDataCallback(this)
+            .openStream(audio_stream);
+
+        if (result != oboe::Result::OK) return false;
+
+        channel_capacity = frames_per_burst;
+        left_channel.reset(new float[channel_capacity]);
+        right_channel.reset(new float[channel_capacity]);
+        std::fill(left_channel.get(), left_channel.get() + channel_capacity, 0.0f);
+        std::fill(right_channel.get(), right_channel.get() + channel_capacity, 0.0f);
+        return true;
+    }
+
+    void start_audio() {
+        if (audio_stream) audio_stream->start();
+    }
+
+    void stop_audio() {
+        if (audio_stream) audio_stream->stop();
+    }
+
+    oboe::DataCallbackResult onAudioReady(
+        oboe::AudioStream* /*stream*/,
+        void* audioData,
+        int32_t numFrames) override {
+
+        if (shutdown.load(std::memory_order_acquire))
+            return oboe::DataCallbackResult::Stop;
+
+        if (!audioData || numFrames <= 0 || numFrames > channel_capacity)
+            return oboe::DataCallbackResult::Stop;
+
+        auto* buffer = static_cast<float*>(audioData);
+
+        for (int32_t i = 0; i < numFrames; ++i) {
+            left_channel[i] = buffer[i * 2];
+            right_channel[i] = buffer[i * 2 + 1];
+        }
+
+        uint32_t input_index = 0;
+        uint32_t output_index = 0;
+        for (auto& p : ports) {
+            if (!p.is_audio) continue;
+
+            float* target = left_channel.get();
+            if (p.is_input) {
+                target = (input_index == 0) ? left_channel.get() : right_channel.get();
+                ++input_index;
+            } else {
+                target = (output_index == 0) ? left_channel.get() : right_channel.get();
+                ++output_index;
+            }
+
+            lilv_instance_connect_port(instance, p.index, target);
+        }
+
+        for (auto& p : ports) {
+            if (p.is_atom && !p.is_input) {
+                p.atom->atom.type = 0;
+                p.atom->atom.size = p.atom_buf_size - sizeof(LV2_Atom);
+            }
+
+            if (p.is_atom && p.is_input) {
+                if (p.atom_state->ui_to_dsp_pending.exchange(false, std::memory_order_acquire)) {
+                    p.atom->atom.type = urids.atom_Sequence;
+                    p.atom->atom.size = 0;
+                    const uint32_t body_size = p.atom_state->ui_to_dsp.size();
+                    uint8_t evbuf[sizeof(LV2_Atom_Event) + required_atom_size];
+                    LV2_Atom_Event* ev = (LV2_Atom_Event*)evbuf;
+                    ev->time.frames = 0;
+                    ev->body.type  = p.atom_state->ui_to_dsp_type;
+                    ev->body.size  = body_size;
+                    memcpy((uint8_t*)LV2_ATOM_BODY(&ev->body),
+                        p.atom_state->ui_to_dsp.data(), body_size);
+                    lv2_atom_sequence_append_event(p.atom, p.atom_buf_size, ev);
+                }
+            }
+        }
+
+        lilv_instance_run(instance, numFrames);
+
+        if (host_worker.iface) deliver_worker_responses(&host_worker);
+
+        for (auto& p : ports) {
+            if (p.is_control && !p.is_input) ui_dirty.store(true, std::memory_order_release);
+            if (p.is_atom && p.is_input) p.atom->atom.size = 0;
+            if (p.is_atom && !p.is_input) {
+                LV2_Atom_Sequence* seq = p.atom;
+                LV2_ATOM_SEQUENCE_FOREACH(seq, ev) {
+                    if (ev->body.size == 0) break;
+                    if (p.atom->atom.type == 0) break;
+                    const uint32_t total = sizeof(LV2_Atom) + ev->body.size;
+                    if (lv2_ringbuffer_write_space(p.atom_state->dsp_to_ui) >= total) {
+                        lv2_ringbuffer_write(p.atom_state->dsp_to_ui,
+                            (const char*)&ev->body, total);
+                    }
+                }
+                p.atom->atom.type = 0;
+                p.atom->atom.size = required_atom_size;
+            }
+        }
+
+        for (int32_t i = 0; i < numFrames; ++i) {
+            buffer[i * 2] = left_channel[i];
+            buffer[i * 2 + 1] = right_channel[i];
+        }
+
+        return oboe::DataCallbackResult::Continue;
+    }
+
+private:
+    std::shared_ptr<oboe::AudioStream> audio_stream;
+    std::unique_ptr<float[]> left_channel;
+    std::unique_ptr<float[]> right_channel;
+    int32_t channel_capacity = 0;
+};
+#endif
 

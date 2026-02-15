@@ -330,6 +330,110 @@ void LV2OboeHost::startAudio() {
 void LV2OboeHost::stopAudio() {
     if (audioStream) audioStream->stop();
 }
+
+---
+
+## API Documentation: Recent Core Host Changes
+
+This section documents the new Android-facing host API and the internal
+initialization changes that enable a JACK-free, Oboe-driven host while keeping
+the Linux X11/JACK host intact.
+
+### New Class: `LV2OboeHost`
+
+**Location:** [LV2JackX11Host.hpp](LV2JackX11Host.hpp)
+
+`LV2OboeHost` derives from `LV2X11JackHost` and `oboe::AudioStreamDataCallback`.
+It uses Oboe for real-time audio and reuses the LV2 port/worker/atom logic.
+
+**Public API**
+
+```cpp
+class LV2OboeHost : public LV2X11JackHost, public oboe::AudioStreamDataCallback {
+public:
+        ~LV2OboeHost();
+
+        bool init_oboe(const char* uri, int32_t sample_rate, int32_t frames_per_burst);
+        bool init_audio(int32_t sample_rate, int32_t frames_per_burst);
+        void start_audio();
+        void stop_audio();
+
+        oboe::DataCallbackResult onAudioReady(
+                oboe::AudioStream* stream,
+                void* audioData,
+                int32_t numFrames) override;
+};
+```
+
+**Behavior Notes**
+
+- `init_oboe()` performs LV2 initialization without JACK and then opens the
+    Oboe stream.
+- `init_audio()` configures a stereo float stream and pre-allocates the
+    per-channel buffers.
+- `onAudioReady()` is RT-safe: no allocations, no locks, no logging.
+- Audio is assumed to be **stereo**; the first two audio input ports map to
+    L/R input, and the first two audio output ports map to L/R output.
+- MIDI is intentionally **not** handled in the Oboe path.
+
+### New Initialization Path (No JACK)
+
+**Added method:** `LV2X11JackHost::init_no_jack()`
+
+```cpp
+bool init_no_jack(const char* uri, double sample_rate, uint32_t max_block);
+```
+
+This path lets Android initialize the LV2 plugin without calling JACK APIs.
+It sets `max_block_length` directly and then calls a JACK-free port setup and
+the sample-rate aware instance initialization.
+
+### Updated Port Initialization
+
+**Changed signature:** `init_ports(bool register_jack)`
+
+- When `register_jack` is `true`, ports are registered with JACK as before.
+- When `false`, no JACK ports are created, but LV2 atom/control buffers are
+    still allocated and connected.
+
+### Updated Instance Initialization
+
+**New overload:** `init_instance(double sample_rate)`
+
+- Allows the LV2 instance to be created with an explicit sample rate
+    (used by Android/Oboe).
+- The original `init_instance()` now delegates to this overload using
+    `jack_get_sample_rate(jack)`.
+
+### Worker Response RT-Safety Change
+
+`deliver_worker_responses()` now uses a preallocated buffer to avoid allocations
+in real-time audio callbacks. If a response exceeds the buffer size, it is
+drained and discarded to keep the audio thread bounded.
+
+---
+
+## Usage Example (C++ / Android Native)
+
+```cpp
+LV2OboeHost host;
+if (!host.init_oboe("http://plugin.uri", 48000, 256)) {
+        // handle failure
+        return;
+}
+
+host.start_audio();
+// ... run audio ...
+host.stop_audio();
+```
+
+### Notes
+
+- The Oboe stream is opened in **exclusive, low-latency** mode with
+    `AudioFormat::Float` and `ChannelCount = 2`.
+- The LV2 worker thread is created if the plugin provides
+    `LV2_Worker_Interface`.
+- Atom UI->DSP messages remain supported via the existing ringbuffer flow.
 ```
 
 ### Audio Callback (Replaces JACK process())
